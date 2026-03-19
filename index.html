@@ -1026,7 +1026,16 @@ tbody tr:hover { background: var(--bg3); }
 // ════════════════════════════════════════════════════════════
 // CONFIGURAÇÃO
 // ════════════════════════════════════════════════════════════
-let API_URL = localStorage.getItem('stockos_api_url') || '';
+// Quando hospedado no Apps Script, a URL da API é a mesma página.
+// Quando aberto como arquivo local, usa a URL salva no localStorage.
+let API_URL = (function() {
+  const loc = window.location.href;
+  if (loc.includes('script.google.com')) {
+    // Rodando dentro do Apps Script — usa a própria URL como API
+    return loc.split('?')[0].replace('/dev', '/exec');
+  }
+  return localStorage.getItem('stockos_api_url') || '';
+})();
 
 // ════════════════════════════════════════════════════════════
 // SESSÃO DO USUÁRIO
@@ -1076,23 +1085,26 @@ async function carregarDoSheets() {
     const ehCaixa = sessao?.papel === 'caixa';
 
     if (ehCaixa) {
-      // Caixa carrega só Entradas e Saídas
-      const [rE, rS] = await Promise.all([
+      const [rE, rS, rC] = await Promise.all([
         apiListar('Entradas'),
         apiListar('Saidas'),
+        apiListar('Categorias'),
       ]);
       db.entradas = rE.dados.map(normalizarEntrada);
       db.saidas   = rS.dados.map(normalizarSaida);
+      dbCats = rC.dados.map(r => ({ id: String(r.id||''), nome: String(r.nome||''), icone: String(r.icone||'🏷️'), cor: String(r.cor||'#3b82f6') })).filter(c=>c.nome);
     } else {
-      // Admin carrega tudo
-      const [rP, rE, rS] = await Promise.all([
+      const [rP, rE, rS, rC] = await Promise.all([
         apiListar('Produtos'),
         apiListar('Entradas'),
         apiListar('Saidas'),
+        apiListar('Categorias'),
       ]);
       db.produtos = rP.dados.map(normalizarProduto);
       db.entradas = rE.dados.map(normalizarEntrada);
       db.saidas   = rS.dados.map(normalizarSaida);
+      dbCats = rC.dados.map(r => ({ id: String(r.id||''), nome: String(r.nome||''), icone: String(r.icone||'🏷️'), cor: String(r.cor||'#3b82f6') })).filter(c=>c.nome);
+      if (!dbCats.length) dbCats = [...CAT_DEFAULT];
     }
 
     db.loaded = true;
@@ -1180,162 +1192,146 @@ function atualizarSaveLabel(txt) {
 
 
 // ════════════════════════════════════════════════════════════
-// CATEGORIAS
+// CATEGORIAS — sincronizadas com Google Sheets
 // ════════════════════════════════════════════════════════════
-const CAT_KEY = 'stockos_categorias_v1';
+
+// Cache local de categorias (carregado do Sheets)
+let dbCats = [];
 
 const CAT_DEFAULT = [
-  { id: 'c1', nome: 'Eletrônicos', icone: '💻', cor: '#3b82f6' },
-  { id: 'c2', nome: 'Papelaria',   icone: '📝', cor: '#10b981' },
-  { id: 'c3', nome: 'Móveis',      icone: '🪑', cor: '#f59e0b' },
-  { id: 'c4', nome: 'Elétrico',    icone: '⚡', cor: '#f97316' },
-  { id: 'c5', nome: 'Impressão',   icone: '🖨️', cor: '#8b5cf6' },
+  { id: 'C0000001', nome: 'Eletrônicos', icone: '💻', cor: '#3b82f6' },
+  { id: 'C0000002', nome: 'Papelaria',   icone: '📝', cor: '#10b981' },
+  { id: 'C0000003', nome: 'Móveis',      icone: '🪑', cor: '#f59e0b' },
+  { id: 'C0000004', nome: 'Elétrico',    icone: '⚡', cor: '#f97316' },
+  { id: 'C0000005', nome: 'Impressão',   icone: '🖨️', cor: '#8b5cf6' },
 ];
 
 function carregarCategorias() {
+  return dbCats.length ? dbCats : CAT_DEFAULT;
+}
+
+async function carregarCategoriasDoSheets() {
   try {
-    const raw = localStorage.getItem(CAT_KEY);
-    return raw ? JSON.parse(raw) : [...CAT_DEFAULT];
-  } catch { return [...CAT_DEFAULT]; }
+    const res = await apiListar('Categorias');
+    dbCats = res.dados.map(r => ({
+      id:    String(r.id   || ''),
+      nome:  String(r.nome || ''),
+      icone: String(r.icone|| '🏷️'),
+      cor:   String(r.cor  || '#3b82f6'),
+    })).filter(c => c.nome);
+    if (!dbCats.length) dbCats = [...CAT_DEFAULT];
+  } catch(e) {
+    // Sem conexão — usa padrão
+    if (!dbCats.length) dbCats = [...CAT_DEFAULT];
+  }
+  atualizarSelectsCategorias();
 }
 
-function salvarCategorias(cats) {
-  localStorage.setItem(CAT_KEY, JSON.stringify(cats));
-}
-
-function adicionarCategoria() {
+async function adicionarCategoria() {
   const nome  = document.getElementById('nova-cat-nome').value.trim();
   const icone = document.getElementById('nova-cat-icone').value.trim() || '🏷️';
   const cor   = document.getElementById('nova-cat-cor').value;
 
   if (!nome) { showToast('Digite o nome da categoria!', 'error'); return; }
-
-  const cats = carregarCategorias();
-  if (cats.find(c => c.nome.toLowerCase() === nome.toLowerCase())) {
+  if (dbCats.find(c => c.nome.toLowerCase() === nome.toLowerCase())) {
     showToast('Categoria já existe!', 'error'); return;
   }
 
-  cats.push({ id: 'c' + Date.now(), nome, icone, cor });
-  salvarCategorias(cats);
-
-  document.getElementById('nova-cat-nome').value  = '';
-  document.getElementById('nova-cat-icone').value = '';
-  document.getElementById('nova-cat-cor').value   = '#3b82f6';
-
-  renderListaCategorias();
-  atualizarSelectsCategorias();
-  showToast(`Categoria "${nome}" criada!`, 'success');
+  try {
+    mostrarLoading(true, 'Salvando categoria...');
+    const res = await apiInserir('Categorias', { nome, icone, cor });
+    dbCats.push({ id: res.id, nome, icone, cor });
+    document.getElementById('nova-cat-nome').value  = '';
+    document.getElementById('nova-cat-icone').value = '';
+    document.getElementById('nova-cat-cor').value   = '#3b82f6';
+    renderListaCategorias();
+    atualizarSelectsCategorias();
+    showToast(`Categoria "${nome}" criada!`, 'success');
+  } catch(e) { showToast('Erro ao salvar: ' + e.message, 'error'); }
+  finally { mostrarLoading(false); }
 }
 
-function excluirCategoria(id) {
-  const cats = carregarCategorias();
-  const cat  = cats.find(c => c.id === id);
+async function excluirCategoria(id) {
+  const cat = dbCats.find(c => c.id === id);
   if (!cat) return;
-
-  // Verifica se há produtos usando esta categoria
   const emUso = db.produtos.filter(p => p.cat === cat.nome).length;
-  if (emUso > 0) {
-    showToast(`Não é possível excluir: ${emUso} produto(s) usam esta categoria.`, 'error');
-    return;
-  }
-
+  if (emUso > 0) { showToast(`Não é possível excluir: ${emUso} produto(s) usam esta categoria.`, 'error'); return; }
   if (!confirm(`Excluir a categoria "${cat.nome}"?`)) return;
-  salvarCategorias(cats.filter(c => c.id !== id));
-  renderListaCategorias();
-  atualizarSelectsCategorias();
-  showToast(`Categoria "${cat.nome}" excluída.`, 'warn');
+  try {
+    mostrarLoading(true, 'Excluindo...');
+    await apiExcluir('Categorias', id);
+    dbCats = dbCats.filter(c => c.id !== id);
+    renderListaCategorias();
+    atualizarSelectsCategorias();
+    showToast(`Categoria "${cat.nome}" excluída.`, 'warn');
+  } catch(e) { showToast('Erro: ' + e.message, 'error'); }
+  finally { mostrarLoading(false); }
 }
 
-function editarNomeCategoria(id, novoNome) {
+async function editarNomeCategoria(id, novoNome) {
   if (!novoNome.trim()) return;
-  const cats = carregarCategorias();
-  const idx  = cats.findIndex(c => c.id === id);
-  if (idx < 0) return;
-  const nomeAntigo = cats[idx].nome;
-  cats[idx].nome = novoNome.trim();
-  salvarCategorias(cats);
-  // Atualiza produtos que usavam o nome antigo (apenas no cache local)
-  db.produtos.forEach(p => { if (p.cat === nomeAntigo) p.cat = novoNome.trim(); });
-  atualizarSelectsCategorias();
-  showToast('Categoria renomeada!', 'success');
+  const cat = dbCats.find(c => c.id === id);
+  if (!cat || cat.nome === novoNome.trim()) return;
+  const nomeAntigo = cat.nome;
+  try {
+    await apiAtualizar('Categorias', { id, nome: novoNome.trim() });
+    cat.nome = novoNome.trim();
+    db.produtos.forEach(p => { if (p.cat === nomeAntigo) p.cat = novoNome.trim(); });
+    atualizarSelectsCategorias();
+    showToast('Categoria renomeada!', 'success');
+  } catch(e) { showToast('Erro ao renomear: ' + e.message, 'error'); }
+}
+
+async function mudarCorCategoria(id, novaCor) {
+  const cat = dbCats.find(c => c.id === id);
+  if (!cat) return;
+  try {
+    await apiAtualizar('Categorias', { id, cor: novaCor });
+    cat.cor = novaCor;
+    renderListaCategorias();
+  } catch(e) { showToast('Erro ao salvar cor: ' + e.message, 'error'); }
 }
 
 function renderListaCategorias() {
   const cats = carregarCategorias();
   const el   = document.getElementById('lista-categorias');
   if (!el) return;
-
   document.getElementById('cat-count').textContent = `${cats.length} categoria(s)`;
-
   if (!cats.length) {
     el.innerHTML = '<div class="empty"><div class="empty-icon">🏷️</div><div class="empty-text">Nenhuma categoria cadastrada</div></div>';
     return;
   }
-
-  el.innerHTML = `
-    <div style="display:grid;gap:10px">
-      ${cats.map(c => {
-        const emUso = db.produtos.filter(p => p.cat === c.nome).length;
-        return `
-        <div style="display:flex;align-items:center;gap:12px;padding:12px 16px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius-sm);transition:var(--transition)" onmouseover="this.style.borderColor='var(--border2)'" onmouseout="this.style.borderColor='var(--border)'">
-          <!-- Ícone colorido -->
-          <div style="width:40px;height:40px;border-radius:10px;background:${c.cor}22;border:2px solid ${c.cor}44;display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0">${c.icone}</div>
-
-          <!-- Nome editável -->
-          <div style="flex:1;min-width:0">
-            <input
-              value="${c.nome}"
-              style="background:transparent;border:none;outline:none;color:var(--text);font-family:var(--font-display);font-size:14px;font-weight:600;width:100%"
-              onblur="editarNomeCategoria('${c.id}', this.value)"
-              onkeydown="if(event.key==='Enter')this.blur()"
-              title="Clique para renomear"
-            >
-            <div style="font-size:11px;color:var(--text3);font-family:var(--font-mono);margin-top:2px">${emUso} produto(s) nesta categoria</div>
-          </div>
-
-          <!-- Cor -->
-          <input type="color" value="${c.cor}" title="Mudar cor"
-            style="width:32px;height:32px;border:1px solid var(--border2);border-radius:6px;background:var(--bg3);cursor:pointer;padding:2px;flex-shrink:0"
-            onchange="mudarCorCategoria('${c.id}', this.value)">
-
-          <!-- Badge de uso -->
-          <span class="badge ${emUso > 0 ? 'badge-blue' : 'badge-gray'}" style="flex-shrink:0">${emUso > 0 ? `${emUso} produtos` : 'Vazia'}</span>
-
-          <!-- Excluir -->
-          <button class="btn btn-ghost btn-sm" onclick="excluirCategoria('${c.id}')" title="Excluir categoria"
-            style="flex-shrink:0;color:var(--red2);border-color:rgba(239,68,68,0.3)" ${emUso > 0 ? 'disabled style="opacity:0.4;cursor:not-allowed"' : ''}>
-            🗑️
-          </button>
-        </div>`;
-      }).join('')}
-    </div>`;
+  el.innerHTML = `<div style="display:grid;gap:10px">
+    ${cats.map(c => {
+      const emUso = db.produtos.filter(p => p.cat === c.nome).length;
+      return `<div style="display:flex;align-items:center;gap:12px;padding:12px 16px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius-sm)">
+        <div style="width:40px;height:40px;border-radius:10px;background:${c.cor}22;border:2px solid ${c.cor}44;display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0">${c.icone}</div>
+        <div style="flex:1;min-width:0">
+          <input value="${c.nome}"
+            style="background:transparent;border:none;outline:none;color:var(--text);font-family:var(--font-display);font-size:14px;font-weight:600;width:100%"
+            onblur="editarNomeCategoria('${c.id}', this.value)"
+            onkeydown="if(event.key==='Enter')this.blur()"
+            title="Clique para renomear">
+          <div style="font-size:11px;color:var(--text3);font-family:var(--font-mono);margin-top:2px">${emUso} produto(s) nesta categoria</div>
+        </div>
+        <input type="color" value="${c.cor}" title="Mudar cor"
+          style="width:32px;height:32px;border:1px solid var(--border2);border-radius:6px;background:var(--bg3);cursor:pointer;padding:2px;flex-shrink:0"
+          onchange="mudarCorCategoria('${c.id}', this.value)">
+        <span class="badge ${emUso > 0 ? 'badge-blue' : 'badge-gray'}" style="flex-shrink:0">${emUso > 0 ? `${emUso} produtos` : 'Vazia'}</span>
+        <button class="btn btn-ghost btn-sm" onclick="excluirCategoria('${c.id}')"
+          style="flex-shrink:0;color:var(--red2);border-color:rgba(239,68,68,0.3)" ${emUso > 0 ? 'disabled' : ''}>🗑️</button>
+      </div>`;
+    }).join('')}
+  </div>`;
 }
 
-function mudarCorCategoria(id, novaCor) {
-  const cats = carregarCategorias();
-  const idx  = cats.findIndex(c => c.id === id);
-  if (idx < 0) return;
-  cats[idx].cor = novaCor;
-  salvarCategorias(cats);
-  renderListaCategorias();
-}
-
-// Atualiza todos os <select> de categoria no app
 function atualizarSelectsCategorias() {
-  const cats    = carregarCategorias();
+  const cats = carregarCategorias();
   const options = cats.map(c => `<option value="${c.nome}">${c.icone} ${c.nome}</option>`).join('');
-
-  // Select no modal de produto
   const pCat = document.getElementById('p-categoria');
   if (pCat) { const val = pCat.value; pCat.innerHTML = options; pCat.value = val || cats[0]?.nome || ''; }
-
-  // Select de filtro na página de produtos
   const fCat = document.getElementById('filter-cat');
-  if (fCat) {
-    const val = fCat.value;
-    fCat.innerHTML = '<option value="">Todas Categorias</option>' + options;
-    fCat.value = val;
-  }
+  if (fCat) { const val = fCat.value; fCat.innerHTML = '<option value="">Todas Categorias</option>' + options; fCat.value = val; }
 }
 
 // ════════════════════════════════════════════════════════════
